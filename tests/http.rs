@@ -342,15 +342,8 @@ fn hook_flow_resolves_project_from_docker_label() {
 }
 
 #[test]
-fn registered_name_wins_over_label() {
+fn hostname_prefix_resolves_project_from_label() {
     let s = start();
-    let r = s.post(
-        "/projects",
-        "application/json",
-        &format!(r#"{{"container_id":"{CONTAINER}","name":"my-api"}}"#),
-    );
-    assert_eq!((r.status, r.body.as_str()), (200, "ok"));
-
     let r = s.hook(
         Some("aaaa00000000"),
         r#"{"session_id":"0123456789abcdef","hook_event_name":"Notification",
@@ -360,10 +353,11 @@ fn registered_name_wins_over_label() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(
         s.wait_notified(),
-        ["許可待ち\u{3000}Bash", "my-api", "01234567", "Glass"]
+        ["許可待ち\u{3000}Bash", "api", "01234567", "Glass"]
     );
     let row = &s.sessions()[0];
-    assert_eq!(row["project"], "my-api");
+    assert_eq!(row["project"], "api");
+    assert_eq!(row["container_id"], CONTAINER);
     assert_eq!(row["local_folder"], "/Users/me/src/api");
 }
 
@@ -402,21 +396,17 @@ fn hook_rejections() {
 }
 
 #[test]
-fn project_rejections() {
+fn removed_endpoints_are_not_found() {
     let s = start();
-    for body in [
-        r#"{"name":"x"}"#,
-        r#"{"container_id":"not-hex"}"#,
-        r#"{"container_id":""}"#,
-        r#"{"container_id":1}"#,
-    ] {
-        assert_eq!(
-            s.post("/projects", "application/json", body).status,
-            400,
-            "{body}"
-        );
-    }
-    assert_eq!(s.get("/projects").status, 405);
+    assert_eq!(
+        s.post(
+            "/projects",
+            "application/json",
+            r#"{"container_id":"aaaa"}"#
+        )
+        .status,
+        404
+    );
 }
 
 #[test]

@@ -9,7 +9,6 @@ use serde::Serialize;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS projects (
   container_id  TEXT PRIMARY KEY,
-  name          TEXT,
   local_folder  TEXT,
   registered_at TEXT NOT NULL
 );
@@ -38,7 +37,7 @@ const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub container_id: String,
-    pub name: Option<String>,
+    /// The host folder from the devcontainer.local_folder label.
     pub local_folder: Option<String>,
 }
 
@@ -56,6 +55,7 @@ pub struct EventRecord<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionRow {
+    /// Filled in by the caller; the store only knows the folder.
     pub project: Option<String>,
     pub container_id: Option<String>,
     pub local_folder: Option<String>,
@@ -95,22 +95,20 @@ impl Store {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Inserts or updates a project. `None` keeps the stored value.
+    /// Inserts or updates a project. `None` keeps the stored folder.
     pub fn upsert_project(
         &self,
         container_id: &str,
-        name: Option<&str>,
         local_folder: Option<&str>,
     ) -> rusqlite::Result<()> {
         self.conn().execute(
             &format!(
-                "INSERT INTO projects (container_id, name, local_folder, registered_at)
-                 VALUES (?1, ?2, ?3, {NOW})
+                "INSERT INTO projects (container_id, local_folder, registered_at)
+                 VALUES (?1, ?2, {NOW})
                  ON CONFLICT (container_id) DO UPDATE SET
-                   name = COALESCE(excluded.name, name),
                    local_folder = COALESCE(excluded.local_folder, local_folder)"
             ),
-            params![container_id, name, local_folder],
+            params![container_id, local_folder],
         )?;
         Ok(())
     }
@@ -119,7 +117,7 @@ impl Store {
     pub fn find_project(&self, id: &str) -> rusqlite::Result<Option<Project>> {
         self.conn()
             .query_row(
-                "SELECT container_id, name, local_folder FROM projects
+                "SELECT container_id, local_folder FROM projects
                  WHERE container_id = ?1 OR substr(container_id, 1, length(?1)) = ?1
                  ORDER BY container_id = ?1 DESC, registered_at DESC
                  LIMIT 1",
@@ -127,8 +125,7 @@ impl Store {
                 |row| {
                     Ok(Project {
                         container_id: row.get(0)?,
-                        name: row.get(1)?,
-                        local_folder: row.get(2)?,
+                        local_folder: row.get(1)?,
                     })
                 },
             )
@@ -186,7 +183,7 @@ impl Store {
     pub fn sessions(&self, limit: u32) -> rusqlite::Result<Vec<SessionRow>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT p.name, s.container_id, p.local_folder, s.session_id, s.title, s.cwd,
+            "SELECT s.container_id, p.local_folder, s.session_id, s.title, s.cwd,
                     s.started_at, s.ended_at, s.last_event_at, s.last_event
              FROM sessions s LEFT JOIN projects p ON p.container_id = s.container_id
              -- Resuming a session ends a throwaway one that never did anything else.
@@ -197,16 +194,16 @@ impl Store {
         )?;
         stmt.query_map([limit], |row| {
             Ok(SessionRow {
-                project: row.get(0)?,
-                container_id: row.get(1)?,
-                local_folder: row.get(2)?,
-                session_id: row.get(3)?,
-                title: row.get(4)?,
-                cwd: row.get(5)?,
-                started_at: row.get(6)?,
-                ended_at: row.get(7)?,
-                last_event_at: row.get(8)?,
-                last_event: row.get(9)?,
+                project: None,
+                container_id: row.get(0)?,
+                local_folder: row.get(1)?,
+                session_id: row.get(2)?,
+                title: row.get(3)?,
+                cwd: row.get(4)?,
+                started_at: row.get(5)?,
+                ended_at: row.get(6)?,
+                last_event_at: row.get(7)?,
+                last_event: row.get(8)?,
             })
         })?
         .collect()
@@ -231,20 +228,18 @@ mod tests {
     const FULL: &str = "43afb2711be74f19612a17a789fdb3dd6ca1ded7737de4a8b1124035f87e41b2";
 
     #[test]
-    fn upsert_keeps_existing_values() {
+    fn upsert_keeps_existing_folder() {
         let s = Store::open_in_memory().unwrap();
-        s.upsert_project(FULL, None, Some("/Users/me/src/api"))
-            .unwrap();
-        s.upsert_project(FULL, Some("api"), None).unwrap();
+        s.upsert_project(FULL, Some("/Users/me/src/api")).unwrap();
+        s.upsert_project(FULL, None).unwrap();
         let p = s.find_project(FULL).unwrap().unwrap();
-        assert_eq!(p.name.as_deref(), Some("api"));
         assert_eq!(p.local_folder.as_deref(), Some("/Users/me/src/api"));
     }
 
     #[test]
     fn find_by_prefix() {
         let s = Store::open_in_memory().unwrap();
-        s.upsert_project(FULL, Some("api"), None).unwrap();
+        s.upsert_project(FULL, None).unwrap();
         assert_eq!(
             s.find_project(&FULL[..12]).unwrap().unwrap().container_id,
             FULL
@@ -257,8 +252,7 @@ mod tests {
     #[test]
     fn session_lifecycle() {
         let s = Store::open_in_memory().unwrap();
-        s.upsert_project(FULL, Some("api"), Some("/Users/me/src/api"))
-            .unwrap();
+        s.upsert_project(FULL, Some("/Users/me/src/api")).unwrap();
         let base = EventRecord {
             session_id: "sess-1",
             container_id: Some(FULL),
@@ -284,7 +278,6 @@ mod tests {
         );
         let rows = s.sessions(10).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].project.as_deref(), Some("api"));
         assert_eq!(rows[0].local_folder.as_deref(), Some("/Users/me/src/api"));
         assert_eq!(rows[0].last_event, "Stop");
         assert!(rows[0].ended_at.is_none());
@@ -345,7 +338,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         Store::open(&path)
             .unwrap()
-            .upsert_project(FULL, Some("api"), None)
+            .upsert_project(FULL, None)
             .unwrap();
         assert!(
             Store::open(&path)

@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::sink::{Notification, State};
 use crate::store::EventRecord;
+use crate::text::{first_sentence, prefix, truncate};
 
 const MAX_DETAIL_CHARS: usize = 80;
 
@@ -78,7 +79,7 @@ impl HookInput {
                 detail: self
                     .last_assistant_message
                     .as_deref()
-                    .and_then(first_sentence),
+                    .and_then(|m| first_sentence(m, MAX_DETAIL_CHARS)),
                 sound: "Ping",
             }),
             "Notification" => Some(match self.notification_type.as_deref() {
@@ -124,7 +125,7 @@ impl HookInput {
         let session = session_title
             .filter(|t| !t.trim().is_empty())
             .map(|t| truncate(t, 60))
-            .unwrap_or_else(|| short_id(&self.session_id).to_string());
+            .unwrap_or_else(|| prefix(&self.session_id, 8).to_string());
         let message = match status.detail {
             Some(detail) => format!("{}\u{3000}{detail}", status.label),
             None => status.label.to_string(),
@@ -160,64 +161,11 @@ pub fn title_from_transcript_line(header: &str) -> Option<String> {
     (!title.is_empty()).then(|| truncate(title, 200))
 }
 
-pub fn short_id(id: &str) -> &str {
-    match id.char_indices().nth(8) {
-        Some((i, _)) => &id[..i],
-        None => id,
-    }
-}
-
-/// The first sentence of an assistant message, without Markdown decoration.
-fn first_sentence(text: &str) -> Option<String> {
-    let mut in_code = false;
-    let line = text.lines().map(str::trim).find(|line| {
-        if line.starts_with("```") {
-            in_code = !in_code;
-            return false;
-        }
-        !in_code && !line.is_empty() && !line.chars().all(|c| "-*_=|#".contains(c))
-    })?;
-
-    let mut line = line.trim_start_matches(['#', '>', ' ']);
-    for bullet in ["- ", "* ", "+ "] {
-        line = line.strip_prefix(bullet).unwrap_or(line);
-    }
-    if let Some((num, rest)) = line.split_once(". ")
-        && !num.is_empty()
-        && num.chars().all(|c| c.is_ascii_digit())
-    {
-        line = rest;
-    }
-    let plain: String = line.replace("**", "").replace("__", "").replace('`', "");
-    let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    let end = plain
-        .char_indices()
-        .find_map(|(i, c)| match c {
-            '。' | '！' | '？' => Some(i + c.len_utf8()),
-            '.' | '!' | '?' => {
-                let next = plain[i + 1..].chars().next();
-                (next.is_none() || next == Some(' ')).then_some(i + 1)
-            }
-            _ => None,
-        })
-        .unwrap_or(plain.len());
-    let sentence = plain[..end].trim();
-    (!sentence.is_empty()).then(|| truncate(sentence, MAX_DETAIL_CHARS))
-}
-
 /// "Claude needs your permission to use Bash" -> "Bash".
 fn permission_tool(message: &str) -> Option<String> {
     let (_, tool) = message.split_once("permission to use ")?;
     let tool = tool.trim().trim_end_matches('.').trim();
     (!tool.is_empty()).then(|| truncate(tool, 40))
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    match text.char_indices().nth(max_chars) {
-        Some((i, _)) => format!("{}…", &text[..i]),
-        None => text.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -293,34 +241,6 @@ mod tests {
             .notification("p", None)
             .unwrap();
         assert_eq!(bare.message, "完了");
-    }
-
-    #[test]
-    fn first_sentences() {
-        let f = |s: &str| first_sentence(s);
-        assert_eq!(
-            f("フックの設定はうまく動いています。ホストのサーバーに届いています。").as_deref(),
-            Some("フックの設定はうまく動いています。")
-        );
-        assert_eq!(
-            f("**`a0e9654`** をコミットしました").as_deref(),
-            Some("a0e9654 をコミットしました")
-        );
-        assert_eq!(
-            f("- 1 つ目の項目。\n- 2 つ目").as_deref(),
-            Some("1 つ目の項目。")
-        );
-        assert_eq!(f("1. Build it. 2. Ship").as_deref(), Some("Build it."));
-        assert_eq!(f("```sh\nls\n```\nDone!").as_deref(), Some("Done!"));
-        assert_eq!(
-            f("---\n\nVersion 1.2 is out").as_deref(),
-            Some("Version 1.2 is out")
-        );
-        assert_eq!(f("   \n\n"), None);
-        assert_eq!(
-            f(&"あ".repeat(200)).unwrap().chars().count(),
-            MAX_DETAIL_CHARS + 1
-        );
     }
 
     #[test]
@@ -415,12 +335,5 @@ mod tests {
         assert!(bad(
             r#"{"session_id":"s","hook_event_name":"Stop","cwd":["x"]}"#
         ));
-    }
-
-    #[test]
-    fn truncation_is_char_safe() {
-        assert_eq!(truncate("あいうえお", 3), "あいう…");
-        assert_eq!(truncate("abc", 3), "abc");
-        assert_eq!(short_id("日本語のセッションID"), "日本語のセッショ");
     }
 }

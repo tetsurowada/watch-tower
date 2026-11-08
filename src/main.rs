@@ -4,9 +4,11 @@ mod docker;
 mod hooks;
 mod notify_compat;
 mod process;
+mod project;
 mod server;
 mod sink;
 mod store;
+mod text;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -16,6 +18,7 @@ use std::time::Duration;
 use cli::{Command, ServeConfig, USAGE};
 use docker::DockerCli;
 use server::App;
+use sink::Sink;
 use sink::macos::Osascript;
 use store::Store;
 
@@ -38,21 +41,13 @@ fn main() -> ExitCode {
 }
 
 fn serve(config: ServeConfig) -> ExitCode {
-    let db = Path::new(&config.db);
-    if let Some(dir) = db.parent().filter(|d| !d.as_os_str().is_empty())
-        && let Err(e) = std::fs::create_dir_all(dir)
-    {
-        eprintln!("watch-tower: failed to create {}: {e}", dir.display());
-        return ExitCode::FAILURE;
-    }
-    let store = match Store::open(db) {
+    let store = match open_store(Path::new(&config.db)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("watch-tower: failed to open {}: {e}", db.display());
+            eprintln!("watch-tower: {e}");
             return ExitCode::FAILURE;
         }
     };
-
     let server = match tiny_http::Server::http(&config.addr) {
         Ok(s) => s,
         Err(e) => {
@@ -64,29 +59,52 @@ fn serve(config: ServeConfig) -> ExitCode {
         eprintln!("watch-tower: listening on {addr}");
     }
 
-    // Inside the .app bundle, use native notifications. Their callbacks need the main
-    // run loop, so the HTTP server moves to another thread.
-    #[cfg(target_os = "macos")]
-    if let Some(native) = sink::native::UserNotifications::new() {
-        let app = Arc::new(App {
-            sink: Box::new(native),
-            store,
-            docker: Box::new(DockerCli::new(config.docker, DOCKER_TIMEOUT)),
-            default_title: config.default_title,
-            log_hooks: config.log_hooks,
-        });
-        std::thread::spawn(move || server::run(server, app));
-        sink::native::run_main_loop();
-    }
-
-    eprintln!("watch-tower: notifications through {}", config.osascript);
+    let (sink, native) = choose_sink(&config.osascript);
     let app = Arc::new(App {
-        sink: Box::new(Osascript::new(config.osascript, OSASCRIPT_TIMEOUT)),
+        sink,
         store,
         docker: Box::new(DockerCli::new(config.docker, DOCKER_TIMEOUT)),
         default_title: config.default_title,
         log_hooks: config.log_hooks,
     });
-    server::run(server, app);
-    ExitCode::SUCCESS
+
+    if !native {
+        server::run(server, app);
+        return ExitCode::SUCCESS;
+    }
+    // Native notification callbacks need the main run loop, so the server moves aside.
+    std::thread::spawn(move || server::run(server, app));
+    run_main_loop()
+}
+
+fn open_store(db: &Path) -> Result<Store, String> {
+    if let Some(dir) = db.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+    }
+    Store::open(db).map_err(|e| format!("failed to open {}: {e}", db.display()))
+}
+
+/// Native notifications inside the .app bundle, osascript everywhere else.
+/// The flag says whether the main thread has to run the native run loop.
+fn choose_sink(osascript: &str) -> (Box<dyn Sink>, bool) {
+    #[cfg(target_os = "macos")]
+    if let Some(native) = sink::native::UserNotifications::new() {
+        return (Box::new(native), true);
+    }
+    eprintln!("watch-tower: notifications through {osascript}");
+    (
+        Box::new(Osascript::new(osascript, OSASCRIPT_TIMEOUT)),
+        false,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn run_main_loop() -> ! {
+    sink::native::run_main_loop()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_main_loop() -> ! {
+    unreachable!("native notifications only exist on macOS")
 }

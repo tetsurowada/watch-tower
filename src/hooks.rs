@@ -5,10 +5,10 @@ use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::sink::Notification;
+use crate::sink::{Notification, State};
 use crate::store::EventRecord;
 
-const MAX_BODY_CHARS: usize = 300;
+const MAX_DETAIL_CHARS: usize = 80;
 
 /// The subset of the hook input watch-tower uses. Unknown fields are ignored.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -69,58 +69,82 @@ impl HookInput {
         }
     }
 
-    /// The notification body, or None when this event does not notify.
-    fn body(&self) -> Option<String> {
+    /// What to say about this event, or None when it is only recorded.
+    fn status(&self) -> Option<Status> {
         match self.hook_event_name.as_str() {
-            "Notification" => Some(
-                self.message
-                    .clone()
-                    .filter(|m| !m.trim().is_empty())
-                    .unwrap_or_else(|| "Claude Code is waiting for you".into()),
-            ),
-            "Stop" => Some(
-                self.last_assistant_message
+            "Stop" => Some(Status {
+                label: "完了",
+                state: Some(State::Done),
+                detail: self
+                    .last_assistant_message
                     .as_deref()
-                    .map(summarize)
-                    .filter(|m| !m.is_empty())
-                    .unwrap_or_else(|| "Claude Code finished responding".into()),
-            ),
+                    .and_then(first_sentence),
+                sound: "Ping",
+            }),
+            "Notification" => Some(match self.notification_type.as_deref() {
+                Some("permission_prompt") => Status {
+                    label: "許可待ち",
+                    state: Some(State::Wait),
+                    detail: self.message.as_deref().and_then(permission_tool),
+                    sound: "Glass",
+                },
+                Some("idle_prompt") => Status {
+                    label: "入力待ち",
+                    state: Some(State::Input),
+                    detail: None,
+                    sound: "Glass",
+                },
+                Some("elicitation_dialog") => Status {
+                    label: "回答待ち",
+                    state: Some(State::Input),
+                    detail: None,
+                    sound: "Glass",
+                },
+                _ => Status {
+                    label: "通知",
+                    state: None,
+                    detail: self
+                        .message
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .map(|m| truncate(m, MAX_DETAIL_CHARS)),
+                    sound: "Glass",
+                },
+            }),
             _ => None,
         }
     }
 
-    fn event_label(&self) -> String {
-        match self.hook_event_name.as_str() {
-            "Notification" => self
-                .title
-                .clone()
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| "Notification".into()),
-            other => other.to_string(),
-        }
-    }
-
-    fn sound(&self) -> &'static str {
-        match self.hook_event_name.as_str() {
-            "Notification" => "Glass",
-            _ => "Ping",
-        }
-    }
-
     /// Builds the notification to show, or None for events that only get recorded.
+    ///
+    /// Title: project. Subtitle: session. Body: state, then a short detail.
     pub fn notification(&self, project: &str, session_title: Option<&str>) -> Option<Notification> {
-        let body = self.body()?;
+        let status = self.status()?;
         let session = session_title
             .filter(|t| !t.trim().is_empty())
-            .map(|t| truncate(t, 40))
+            .map(|t| truncate(t, 60))
             .unwrap_or_else(|| short_id(&self.session_id).to_string());
+        let message = match status.detail {
+            Some(detail) => format!("{}\u{3000}{detail}", status.label),
+            None => status.label.to_string(),
+        };
         Some(Notification {
             title: truncate(project, 80),
-            subtitle: format!("{session} · {}", truncate(&self.event_label(), 60)),
-            message: body,
-            sound: self.sound().to_string(),
+            subtitle: session,
+            message,
+            sound: status.sound.to_string(),
+            thread: self.session_id.clone(),
+            state: status.state,
         })
     }
+}
+
+struct Status {
+    label: &'static str,
+    state: Option<State>,
+    detail: Option<String>,
+    sound: &'static str,
 }
 
 /// Decodes the `X-Session-Title-Line` header: a base64-encoded transcript line such as
@@ -143,10 +167,50 @@ pub fn short_id(id: &str) -> &str {
     }
 }
 
-/// Collapses whitespace and cuts long assistant messages down to a notification body.
-fn summarize(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate(&collapsed, MAX_BODY_CHARS)
+/// The first sentence of an assistant message, without Markdown decoration.
+fn first_sentence(text: &str) -> Option<String> {
+    let mut in_code = false;
+    let line = text.lines().map(str::trim).find(|line| {
+        if line.starts_with("```") {
+            in_code = !in_code;
+            return false;
+        }
+        !in_code && !line.is_empty() && !line.chars().all(|c| "-*_=|#".contains(c))
+    })?;
+
+    let mut line = line.trim_start_matches(['#', '>', ' ']);
+    for bullet in ["- ", "* ", "+ "] {
+        line = line.strip_prefix(bullet).unwrap_or(line);
+    }
+    if let Some((num, rest)) = line.split_once(". ")
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit())
+    {
+        line = rest;
+    }
+    let plain: String = line.replace("**", "").replace("__", "").replace('`', "");
+    let plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let end = plain
+        .char_indices()
+        .find_map(|(i, c)| match c {
+            '。' | '！' | '？' => Some(i + c.len_utf8()),
+            '.' | '!' | '?' => {
+                let next = plain[i + 1..].chars().next();
+                (next.is_none() || next == Some(' ')).then_some(i + 1)
+            }
+            _ => None,
+        })
+        .unwrap_or(plain.len());
+    let sentence = plain[..end].trim();
+    (!sentence.is_empty()).then(|| truncate(sentence, MAX_DETAIL_CHARS))
+}
+
+/// "Claude needs your permission to use Bash" -> "Bash".
+fn permission_tool(message: &str) -> Option<String> {
+    let (_, tool) = message.split_once("permission to use ")?;
+    let tool = tool.trim().trim_end_matches('.').trim();
+    (!tool.is_empty()).then(|| truncate(tool, 40))
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -165,46 +229,112 @@ mod tests {
     }
 
     #[test]
-    fn parses_documented_notification_input() {
+    fn permission_prompt() {
         let i = input(
             r#"{"session_id":"abc123","transcript_path":"/x.jsonl","cwd":"/workspaces/api",
-                "hook_event_name":"Notification","message":"Claude needs your permission",
+                "hook_event_name":"Notification","message":"Claude needs your permission to use Bash",
                 "title":"Permission needed","notification_type":"permission_prompt",
                 "effort":{"level":"high"}}"#,
         );
-        let n = i.notification("api", None).unwrap();
-        assert_eq!(n.title, "api");
-        assert_eq!(n.subtitle, "abc123 · Permission needed");
-        assert_eq!(n.message, "Claude needs your permission");
-        assert_eq!(n.sound, "Glass");
-    }
-
-    #[test]
-    fn stop_uses_last_assistant_message_and_session_title() {
-        let i = input(
-            r#"{"session_id":"0123456789abcdef","hook_event_name":"Stop",
-                "last_assistant_message":"Done.\n\nAll   tests pass.","stop_hook_active":false}"#,
-        );
         let n = i.notification("api", Some("Fix login")).unwrap();
-        assert_eq!(n.subtitle, "Fix login · Stop");
-        assert_eq!(n.message, "Done. All tests pass.");
-        assert_eq!(n.sound, "Ping");
-
-        let n = i.notification("api", None).unwrap();
-        assert_eq!(n.subtitle, "01234567 · Stop");
+        assert_eq!(n.title, "api");
+        assert_eq!(n.subtitle, "Fix login");
+        assert_eq!(n.message, "許可待ち\u{3000}Bash");
+        assert_eq!(n.sound, "Glass");
+        assert_eq!(n.thread, "abc123");
+        assert_eq!(n.state, Some(State::Wait));
     }
 
     #[test]
-    fn fallbacks_when_fields_are_missing() {
-        let n = input(r#"{"session_id":"s","hook_event_name":"Stop"}"#)
+    fn notification_types() {
+        let n = |ty: &str, msg: &str| {
+            input(&format!(
+                r#"{{"session_id":"s","hook_event_name":"Notification","notification_type":"{ty}","message":"{msg}"}}"#
+            ))
+            .notification("p", None)
+            .unwrap()
+        };
+        let idle = n("idle_prompt", "Claude is waiting for your input");
+        assert_eq!(
+            (idle.message.as_str(), idle.state),
+            ("入力待ち", Some(State::Input))
+        );
+        let ask = n("elicitation_dialog", "Answer the question");
+        assert_eq!(
+            (ask.message.as_str(), ask.state),
+            ("回答待ち", Some(State::Input))
+        );
+        let unknown_permission = n("permission_prompt", "Something else");
+        assert_eq!(unknown_permission.message, "許可待ち");
+        let other = n("auth_success", "Logged in");
+        assert_eq!(
+            (other.message.as_str(), other.state),
+            ("通知\u{3000}Logged in", None)
+        );
+        let missing = input(r#"{"session_id":"s","hook_event_name":"Notification"}"#)
             .notification("p", None)
             .unwrap();
-        assert_eq!(n.message, "Claude Code finished responding");
-        let n = input(r#"{"session_id":"s","hook_event_name":"Notification","message":" "}"#)
+        assert_eq!(missing.message, "通知");
+    }
+
+    #[test]
+    fn stop_uses_first_sentence() {
+        let i = input(
+            r##"{"session_id":"0123456789abcdef","hook_event_name":"Stop",
+                "last_assistant_message":"# Done.\n\nAll   tests pass.","stop_hook_active":false}"##,
+        );
+        let n = i.notification("api", None).unwrap();
+        assert_eq!(n.subtitle, "01234567");
+        assert_eq!(n.message, "完了\u{3000}Done.");
+        assert_eq!(n.sound, "Ping");
+        assert_eq!(n.state, Some(State::Done));
+
+        let bare = input(r#"{"session_id":"s","hook_event_name":"Stop"}"#)
             .notification("p", None)
             .unwrap();
-        assert_eq!(n.message, "Claude Code is waiting for you");
-        assert_eq!(n.subtitle, "s · Notification");
+        assert_eq!(bare.message, "完了");
+    }
+
+    #[test]
+    fn first_sentences() {
+        let f = |s: &str| first_sentence(s);
+        assert_eq!(
+            f("フックの設定はうまく動いています。ホストのサーバーに届いています。").as_deref(),
+            Some("フックの設定はうまく動いています。")
+        );
+        assert_eq!(
+            f("**`a0e9654`** をコミットしました").as_deref(),
+            Some("a0e9654 をコミットしました")
+        );
+        assert_eq!(
+            f("- 1 つ目の項目。\n- 2 つ目").as_deref(),
+            Some("1 つ目の項目。")
+        );
+        assert_eq!(f("1. Build it. 2. Ship").as_deref(), Some("Build it."));
+        assert_eq!(f("```sh\nls\n```\nDone!").as_deref(), Some("Done!"));
+        assert_eq!(
+            f("---\n\nVersion 1.2 is out").as_deref(),
+            Some("Version 1.2 is out")
+        );
+        assert_eq!(f("   \n\n"), None);
+        assert_eq!(
+            f(&"あ".repeat(200)).unwrap().chars().count(),
+            MAX_DETAIL_CHARS + 1
+        );
+    }
+
+    #[test]
+    fn permission_tools() {
+        assert_eq!(
+            permission_tool("Claude needs your permission to use Bash").as_deref(),
+            Some("Bash")
+        );
+        assert_eq!(
+            permission_tool("Claude needs your permission to use mcp__github__create_issue.")
+                .as_deref(),
+            Some("mcp__github__create_issue")
+        );
+        assert_eq!(permission_tool("Claude needs your permission"), None);
     }
 
     #[test]
@@ -292,7 +422,5 @@ mod tests {
         assert_eq!(truncate("あいうえお", 3), "あいう…");
         assert_eq!(truncate("abc", 3), "abc");
         assert_eq!(short_id("日本語のセッションID"), "日本語のセッショ");
-        let long = "x ".repeat(400);
-        assert_eq!(summarize(&long).chars().count(), MAX_BODY_CHARS + 1);
     }
 }

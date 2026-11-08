@@ -68,6 +68,8 @@ mod tests {
             title: "t".into(),
             subtitle: String::new(),
             sound: String::new(),
+            thread: String::new(),
+            state: None,
         }
     }
 

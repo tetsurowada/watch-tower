@@ -64,6 +64,22 @@ fn serve(config: ServeConfig) -> ExitCode {
         eprintln!("watch-tower: listening on {addr}");
     }
 
+    // Inside the .app bundle, use native notifications. Their callbacks need the main
+    // run loop, so the HTTP server moves to another thread.
+    #[cfg(target_os = "macos")]
+    if let Some(native) = sink::native::UserNotifications::new() {
+        let app = Arc::new(App {
+            sink: Box::new(native),
+            store,
+            docker: Box::new(DockerCli::new(config.docker, DOCKER_TIMEOUT)),
+            default_title: config.default_title,
+            log_hooks: config.log_hooks,
+        });
+        std::thread::spawn(move || server::run(server, app));
+        sink::native::run_main_loop();
+    }
+
+    eprintln!("watch-tower: notifications through {}", config.osascript);
     let app = Arc::new(App {
         sink: Box::new(Osascript::new(config.osascript, OSASCRIPT_TIMEOUT)),
         store,

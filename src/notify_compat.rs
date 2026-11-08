@@ -74,6 +74,8 @@ impl Params {
             title,
             subtitle,
             sound,
+            thread: String::new(),
+            state: None,
         })
     }
 
@@ -148,6 +150,8 @@ mod tests {
                 title: "Default".into(),
                 subtitle: String::new(),
                 sound: String::new(),
+                thread: String::new(),
+                state: None,
             }
         );
     }

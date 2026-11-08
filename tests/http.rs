@@ -316,7 +316,7 @@ fn hook_flow_resolves_project_from_docker_label() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(
         s.wait_notified(),
-        ["Done. All tests pass.", "api", "Fix login · Stop", "Ping"]
+        ["完了\u{3000}Done.", "api", "Fix login", "Ping"]
     );
 
     let sessions = s.sessions();
@@ -354,18 +354,13 @@ fn registered_name_wins_over_label() {
     let r = s.hook(
         Some("aaaa00000000"),
         r#"{"session_id":"0123456789abcdef","hook_event_name":"Notification",
-            "message":"Claude needs your permission","title":"Permission needed",
+            "message":"Claude needs your permission to use Bash","title":"Permission needed",
             "notification_type":"permission_prompt"}"#,
     );
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(
         s.wait_notified(),
-        [
-            "Claude needs your permission",
-            "my-api",
-            "01234567 · Permission needed",
-            "Glass"
-        ]
+        ["許可待ち\u{3000}Bash", "my-api", "01234567", "Glass"]
     );
     let row = &s.sessions()[0];
     assert_eq!(row["project"], "my-api");
@@ -437,7 +432,7 @@ fn transcript_title_header_names_the_session() {
         r#"{"session_id":"0123456789abcdef","hook_event_name":"Stop"}"#,
     );
     assert_eq!(r.status, 200, "{}", r.body);
-    assert_eq!(s.wait_notified()[2], "Fix login · Stop");
+    assert_eq!(s.wait_notified()[2], "Fix login");
     assert_eq!(s.sessions()[0]["title"], "Fix login");
 
     // A broken header is ignored, and the stored title stays.
@@ -448,5 +443,5 @@ fn transcript_title_header_names_the_session() {
         r#"{"session_id":"0123456789abcdef","hook_event_name":"Stop"}"#,
     );
     assert_eq!(r.status, 200);
-    assert_eq!(s.wait_notified()[2], "Fix login · Stop");
+    assert_eq!(s.wait_notified()[2], "Fix login");
 }

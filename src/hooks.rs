@@ -1,5 +1,7 @@
 //! Claude Code hook events received on `/hooks/claude`.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -39,14 +41,22 @@ impl HookInput {
         Ok(input)
     }
 
-    pub fn record<'a>(&'a self, container_id: Option<&'a str>) -> EventRecord<'a> {
+    /// `transcript_title` is the latest title read from the transcript; it wins over
+    /// `session_title`, which SessionStart only carries for resumed sessions.
+    pub fn record<'a>(
+        &'a self,
+        container_id: Option<&'a str>,
+        transcript_title: Option<&'a str>,
+    ) -> EventRecord<'a> {
         EventRecord {
             session_id: &self.session_id,
             container_id,
             cwd: self.cwd.as_deref(),
             kind: &self.hook_event_name,
             message: self.raw_message(),
-            title: self.session_title.as_deref().filter(|t| !t.is_empty()),
+            title: transcript_title
+                .or(self.session_title.as_deref())
+                .filter(|t| !t.trim().is_empty()),
             ends_session: self.hook_event_name == "SessionEnd",
         }
     }
@@ -111,6 +121,19 @@ impl HookInput {
             sound: self.sound().to_string(),
         })
     }
+}
+
+/// Decodes the `X-Session-Title-Line` header: a base64-encoded transcript line such as
+/// `{"type":"ai-title","aiTitle":"..."}` or `{"type":"custom-title","customTitle":"..."}`.
+pub fn title_from_transcript_line(header: &str) -> Option<String> {
+    let bytes = STANDARD.decode(header.trim()).ok()?;
+    let line: Value = serde_json::from_slice(&bytes).ok()?;
+    let title = line
+        .get("customTitle")
+        .or_else(|| line.get("aiTitle"))?
+        .as_str()?
+        .trim();
+    (!title.is_empty()).then(|| truncate(title, 200))
 }
 
 pub fn short_id(id: &str) -> &str {
@@ -200,7 +223,7 @@ mod tests {
             r#"{"session_id":"s","hook_event_name":"SessionStart","source":"startup",
                 "session_title":"Fix login","cwd":"/w"}"#,
         );
-        let r = start.record(Some("abc"));
+        let r = start.record(Some("abc"), None);
         assert_eq!(r.title, Some("Fix login"));
         assert_eq!(r.cwd, Some("/w"));
         assert_eq!(r.container_id, Some("abc"));
@@ -208,11 +231,48 @@ mod tests {
         assert_eq!(r.message, None);
 
         let end = input(r#"{"session_id":"s","hook_event_name":"SessionEnd","reason":"other"}"#);
-        assert!(end.record(None).ends_session);
+        assert!(end.record(None, None).ends_session);
 
         let stop =
             input(r#"{"session_id":"s","hook_event_name":"Stop","last_assistant_message":"hi"}"#);
-        assert_eq!(stop.record(None).message, Some("hi"));
+        assert_eq!(stop.record(None, None).message, Some("hi"));
+    }
+
+    #[test]
+    fn transcript_title_wins() {
+        let start =
+            input(r#"{"session_id":"s","hook_event_name":"SessionStart","session_title":"old"}"#);
+        assert_eq!(start.record(None, Some("new")).title, Some("new"));
+        let stop = input(r#"{"session_id":"s","hook_event_name":"Stop"}"#);
+        assert_eq!(stop.record(None, None).title, None);
+    }
+
+    #[test]
+    fn title_header() {
+        let enc = |s: &str| STANDARD.encode(s);
+        assert_eq!(
+            title_from_transcript_line(&enc(
+                r#"{"type":"ai-title","aiTitle":"Rust-rewrite用のmise.toml","sessionId":"x"}"#
+            ))
+            .as_deref(),
+            Some("Rust-rewrite用のmise.toml")
+        );
+        assert_eq!(
+            title_from_transcript_line(&enc(
+                r#"{"type":"custom-title","customTitle":" Fix login ","sessionId":"x"}"#
+            ))
+            .as_deref(),
+            Some("Fix login")
+        );
+        for bad in [
+            "",
+            "!!!",
+            &enc("not json"),
+            &enc(r#"{"aiTitle":1}"#),
+            &enc(r#"{"aiTitle":"  "}"#),
+        ] {
+            assert_eq!(title_from_transcript_line(bad), None, "{bad}");
+        }
     }
 
     #[test]

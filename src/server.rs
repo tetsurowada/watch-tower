@@ -9,7 +9,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::body::{self, BodyError, MAX_BODY};
 use crate::docker::{self, ContainerLookup};
-use crate::hooks::HookInput;
+use crate::hooks::{self, HookInput};
 use crate::notify_compat::Params;
 use crate::sink::Sink;
 use crate::store::{Project, Store};
@@ -123,8 +123,10 @@ fn route(app: &Arc<App>, request: &mut Request) -> Reply {
             let container_id = header_value(request, "X-Container-Id")
                 .map(|v| v.trim().to_ascii_lowercase())
                 .filter(|v| docker::is_container_id(v));
+            let title = header_value(request, "X-Session-Title-Line")
+                .and_then(hooks::title_from_transcript_line);
             match read_body(request) {
-                Ok(Some(map)) => claude_hook(app, map, container_id),
+                Ok(Some(map)) => claude_hook(app, map, container_id, title),
                 Ok(None) => Reply::error(400, "body is required"),
                 Err(reply) => reply,
             }
@@ -175,7 +177,12 @@ fn notify(app: &App, query: &str, body: Option<Map<String, Value>>) -> Reply {
     }
 }
 
-fn claude_hook(app: &Arc<App>, map: Map<String, Value>, container_id: Option<String>) -> Reply {
+fn claude_hook(
+    app: &Arc<App>,
+    map: Map<String, Value>,
+    container_id: Option<String>,
+    transcript_title: Option<String>,
+) -> Reply {
     if app.log_hooks {
         eprintln!(
             "hook payload container={} {}",
@@ -195,7 +202,10 @@ fn claude_hook(app: &Arc<App>, map: Map<String, Value>, container_id: Option<Str
         .as_ref()
         .map(|p| p.container_id.clone())
         .or(container_id);
-    if let Err(e) = app.store.record_event(&input.record(stored_id.as_deref())) {
+    if let Err(e) = app
+        .store
+        .record_event(&input.record(stored_id.as_deref(), transcript_title.as_deref()))
+    {
         eprintln!("failed to record hook event: {e}");
     }
 

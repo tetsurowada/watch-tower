@@ -423,3 +423,30 @@ fn project_rejections() {
     }
     assert_eq!(s.get("/projects").status, 405);
 }
+
+#[test]
+fn transcript_title_header_names_the_session() {
+    let s = start();
+    // base64 of {"type":"ai-title","aiTitle":"Fix login"}
+    let header =
+        "X-Session-Title-Line: eyJ0eXBlIjoiYWktdGl0bGUiLCJhaVRpdGxlIjoiRml4IGxvZ2luIn0=\r\n";
+    let r = s.post_with(
+        "/hooks/claude",
+        "application/json",
+        header,
+        r#"{"session_id":"0123456789abcdef","hook_event_name":"Stop"}"#,
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(s.wait_notified()[2], "Fix login · Stop");
+    assert_eq!(s.sessions()[0]["title"], "Fix login");
+
+    // A broken header is ignored, and the stored title stays.
+    let r = s.post_with(
+        "/hooks/claude",
+        "application/json",
+        "X-Session-Title-Line: !!!\r\n",
+        r#"{"session_id":"0123456789abcdef","hook_event_name":"Stop"}"#,
+    );
+    assert_eq!(r.status, 200);
+    assert_eq!(s.wait_notified()[2], "Fix login · Stop");
+}

@@ -189,6 +189,9 @@ impl Store {
             "SELECT p.name, s.container_id, p.local_folder, s.session_id, s.title, s.cwd,
                     s.started_at, s.ended_at, s.last_event_at, s.last_event
              FROM sessions s LEFT JOIN projects p ON p.container_id = s.container_id
+             -- Resuming a session ends a throwaway one that never did anything else.
+             WHERE EXISTS (SELECT 1 FROM events e
+                           WHERE e.session_id = s.session_id AND e.kind <> 'SessionEnd')
              ORDER BY s.last_event_at DESC, s.rowid DESC
              LIMIT ?1",
         )?;
@@ -312,6 +315,26 @@ mod tests {
         assert!(rows[0].project.is_none());
         assert!(s.session_title("late").unwrap().is_none());
         assert!(s.session_title("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn sessions_with_only_session_end_are_hidden() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_event(&EventRecord {
+            session_id: "throwaway",
+            kind: "SessionEnd",
+            ends_session: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(s.sessions(10).unwrap().is_empty());
+        s.record_event(&EventRecord {
+            session_id: "throwaway",
+            kind: "Stop",
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(s.sessions(10).unwrap().len(), 1);
     }
 
     #[test]

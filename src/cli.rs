@@ -8,6 +8,10 @@ Flags for serve:
   -addr string           listen address (default \":4567\")
   -osascript string      osascript executable (default \"osascript\")
   -default-title string  title used when none is given (default \"Claude Code\")
+  -db string             SQLite database
+                         (default \"~/Library/Application Support/watch-tower/watch-tower.db\")
+  -docker string         docker executable (default \"docker\")
+  -log-hooks             log every received hook payload to stderr
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +19,9 @@ pub struct ServeConfig {
     pub addr: String,
     pub osascript: String,
     pub default_title: String,
+    pub db: String,
+    pub docker: String,
+    pub log_hooks: bool,
 }
 
 impl Default for ServeConfig {
@@ -23,6 +30,9 @@ impl Default for ServeConfig {
             addr: normalize_addr(":4567"),
             osascript: "osascript".to_string(),
             default_title: "Claude Code".to_string(),
+            db: default_db(),
+            docker: "docker".to_string(),
+            log_hooks: false,
         }
     }
 }
@@ -40,6 +50,7 @@ pub enum CliError {
     UnknownFlag(String),
     MissingValue(String),
     UnexpectedArgument(String),
+    InvalidValue(String),
 }
 
 impl fmt::Display for CliError {
@@ -50,6 +61,7 @@ impl fmt::Display for CliError {
             Self::UnknownFlag(flag) => write!(f, "flag provided but not defined: {flag}"),
             Self::MissingValue(flag) => write!(f, "flag needs an argument: {flag}"),
             Self::UnexpectedArgument(a) => write!(f, "unexpected argument: {a}"),
+            Self::InvalidValue(a) => write!(f, "invalid value for flag: {a}"),
         }
     }
 }
@@ -90,10 +102,20 @@ fn parse_serve(args: &[String]) -> Result<Command, CliError> {
         if matches!(name, "h" | "help") {
             return Ok(Command::Help);
         }
+        if name == "log-hooks" {
+            config.log_hooks = match inline.as_deref() {
+                None | Some("true" | "1") => true,
+                Some("false" | "0") => false,
+                Some(_) => return Err(CliError::InvalidValue(arg.clone())),
+            };
+            continue;
+        }
         let target = match name {
             "addr" => &mut config.addr,
             "osascript" => &mut config.osascript,
             "default-title" => &mut config.default_title,
+            "db" => &mut config.db,
+            "docker" => &mut config.docker,
             _ => return Err(CliError::UnknownFlag(arg.clone())),
         };
         *target = match inline {
@@ -106,6 +128,16 @@ fn parse_serve(args: &[String]) -> Result<Command, CliError> {
     }
     config.addr = normalize_addr(&config.addr);
     Ok(Command::Serve(config))
+}
+
+fn default_db() -> String {
+    match std::env::var_os("HOME") {
+        Some(home) => std::path::Path::new(&home)
+            .join("Library/Application Support/watch-tower/watch-tower.db")
+            .to_string_lossy()
+            .into_owned(),
+        None => "watch-tower.db".to_string(),
+    }
 }
 
 /// `:4567` listens on every interface, as Go's `net.Listen` does.
@@ -161,6 +193,31 @@ mod tests {
         ]);
         assert_eq!(c.osascript, "/bin/fake");
         assert_eq!(c.default_title, "Hello world");
+    }
+
+    #[test]
+    fn storage_and_docker_flags() {
+        let c = serve(&["serve", "-db", "/tmp/x.db", "-docker=/bin/fake-docker"]);
+        assert_eq!(c.db, "/tmp/x.db");
+        assert_eq!(c.docker, "/bin/fake-docker");
+        assert!(serve(&["serve"]).db.ends_with("watch-tower/watch-tower.db"));
+    }
+
+    #[test]
+    fn bool_flag() {
+        assert!(!serve(&["serve"]).log_hooks);
+        assert!(serve(&["serve", "-log-hooks"]).log_hooks);
+        assert!(serve(&["serve", "--log-hooks=true"]).log_hooks);
+        assert!(!serve(&["serve", "-log-hooks", "-log-hooks=false"]).log_hooks);
+        // A bool flag does not consume the next argument.
+        assert_eq!(
+            serve(&["serve", "-log-hooks", "-addr", ":9"]).addr,
+            "0.0.0.0:9"
+        );
+        assert_eq!(
+            parse(&args(&["serve", "-log-hooks=yes"])),
+            Err(CliError::InvalidValue("-log-hooks=yes".into()))
+        );
     }
 
     #[test]

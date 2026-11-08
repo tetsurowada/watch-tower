@@ -12,5 +12,7 @@ case "$3" in
     ;;
 esac
 if [ -n "$FAKE_OSASCRIPT_OUT" ]; then
-  printf '%s\0' "$@" > "$FAKE_OSASCRIPT_OUT"
+  # Write then rename so readers never see a partial file.
+  printf '%s\0' "$@" > "$FAKE_OSASCRIPT_OUT.tmp"
+  mv "$FAKE_OSASCRIPT_OUT.tmp" "$FAKE_OSASCRIPT_OUT"
 fi

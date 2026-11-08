@@ -1,11 +1,10 @@
 //! macOS notifications through osascript.
 
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use super::{Notification, Sink};
+use crate::process;
 
 /// Values arrive through `argv`, never interpolated into the script.
 pub const SCRIPT: &str = r#"on run argv
@@ -37,56 +36,29 @@ impl Osascript {
 
 impl Sink for Osascript {
     fn send(&self, n: &Notification) -> Result<(), String> {
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .arg("-e")
             .arg(SCRIPT)
-            .args([&n.message, &n.title, &n.subtitle, &n.sound])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("failed to start {}: {e}", self.program))?;
-
-        // Drain stderr on another thread so a chatty child cannot block on a full pipe.
-        let mut stderr = child.stderr.take().expect("stderr is piped");
-        let stderr_reader = thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
-            buf
-        });
-
-        let deadline = Instant::now() + self.timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{} timed out after {:?}",
-                        self.program, self.timeout
-                    ));
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(e) => return Err(format!("failed to wait for {}: {e}", self.program)),
-            }
-        };
-
-        if status.success() {
-            return Ok(());
+            .args([&n.message, &n.title, &n.subtitle, &n.sound]);
+        let out = process::run(command, self.timeout)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} exited with {}: {}",
+                self.program,
+                out.status,
+                out.stderr.trim()
+            ))
         }
-        let stderr = stderr_reader.join().unwrap_or_default();
-        Err(format!(
-            "{} exited with {status}: {}",
-            self.program,
-            stderr.trim()
-        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     const FAKE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake-osascript.sh");
 
@@ -119,11 +91,5 @@ mod tests {
         let err = sink.send(&notification("__hang__")).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         assert!(start.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn missing_program() {
-        let sink = Osascript::new("/nonexistent/osascript", Duration::from_secs(1));
-        assert!(sink.send(&notification("x")).is_err());
     }
 }

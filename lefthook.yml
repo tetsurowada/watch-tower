@@ -1,0 +1,22 @@
+# Lima の virtiofs では、.git/index を書き換えてから 1 秒ほどは古い内容が読める。
+# そのまま進むと、gitleaks が git add 直後の差分を見落とし、git commit が
+# フック後に読み直すインデックスも空になる。前後で 1 秒ずつ待って避ける。
+pre-commit:
+  piped: true
+  jobs:
+    - name: wait-before
+      run: sleep 1
+
+    - name: checks
+      group:
+        parallel: true
+        jobs:
+          - name: gitleaks
+            run: gitleaks git --pre-commit --staged --redact --no-banner --verbose
+
+          - name: rustfmt
+            glob: "*.rs"
+            run: cargo fmt --check
+
+    - name: wait-after
+      run: sleep 1
